@@ -1,0 +1,217 @@
+/* ESP32-CAM 控制台样式 */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+    background: #181818;
+    color: #eaeaea;
+}
+
+.container {
+    display: flex;
+    min-height: 100vh;
+}
+
+/* ---------- 侧边栏 ---------- */
+.sidebar {
+    width: 300px;
+    flex-shrink: 0;
+    background: #232323;
+    padding: 16px;
+    overflow-y: auto;
+}
+
+.sidebar h1 {
+    font-size: 18px;
+    margin-bottom: 16px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #3a3a3a;
+}
+
+.group {
+    margin-bottom: 18px;
+}
+
+.group > label {
+    display: block;
+    font-size: 14px;
+    margin-bottom: 6px;
+    color: #cfcfcf;
+}
+
+.hint { font-size: 12px; color: #8a8a8a; }
+
+/* ---------- 控件 ---------- */
+.button {
+    background: #e74c3c;
+    color: #fff;
+    border: 0;
+    border-radius: 4px;
+    padding: 8px 14px;
+    font-size: 14px;
+    cursor: pointer;
+}
+.button:hover { background: #c9402f; }
+.button.small { padding: 4px 12px; margin-left: 8px; }
+
+select {
+    width: 100%;
+    background: #1b1b1b;
+    color: #eaeaea;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-size: 13px;
+}
+
+.range-row {
+    display: flex;
+    align-items: center;
+}
+.range-row input[type="range"] { flex: 1; accent-color: #e74c3c; }
+.value {
+    min-width: 34px;
+    text-align: center;
+    font-size: 13px;
+    color: #ffb0a6;
+}
+
+/* ---------- 云台遥控 ---------- */
+.ptz-pad {
+    display: grid;
+    grid-template-areas:
+        ". u ."
+        "l t r"
+        ". d .";
+    grid-template-columns: repeat(3, 64px);
+    grid-template-rows: repeat(3, 64px);
+    gap: 8px;
+    justify-content: center;
+    margin: 10px auto 6px;
+    user-select: none;
+    -webkit-user-select: none;
+}
+.ptz-btn {
+    border: 0;
+    border-radius: 12px;
+    background: #2e2e2e;
+    color: #eaeaea;
+    font-size: 20px;
+    cursor: pointer;
+    /* 禁止触摸长按选中/弹出菜单, 保证按住事件完整 */
+    touch-action: none;
+    -webkit-touch-callout: none;
+}
+.ptz-btn:hover { background: #3a3a3a; }
+.ptz-btn.active { background: #e74c3c; }
+.ptz-up    { grid-area: u; }
+.ptz-down  { grid-area: d; }
+.ptz-left  { grid-area: l; }
+.ptz-right { grid-area: r; }
+.ptz-talk {
+    grid-area: t;
+    border-radius: 50%;
+    background: #1e8e3e;
+    font-size: 15px;
+}
+.ptz-talk:hover { background: #187533; }
+.ptz-talk.active { background: #e74c3c; }
+
+/* ---------- 录制 (占位, 功能后期实现) ---------- */
+select:disabled { opacity: 0.45; cursor: not-allowed; }
+.rec-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+}
+.rec-btn {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    background: #2e2e2e;
+    color: #eaeaea;
+    border: 1px solid #4a4a4a;
+    border-radius: 20px;
+    padding: 9px 14px;
+    font-size: 14px;
+    cursor: pointer;
+}
+.rec-btn::before {
+    content: "";
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #e74c3c;
+    flex-shrink: 0;
+}
+.rec-btn:hover:not(:disabled) { background: #3a3a3a; }
+.rec-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+/* 录制中的状态(后期 JS 加 class 即可启用): 红点闪烁 */
+.rec-btn.recording { border-color: #e74c3c; }
+.rec-btn.recording::before { animation: rec-blink 1s step-start infinite; }
+@keyframes rec-blink { 50% { opacity: 0.15; } }
+.rec-status { font-size: 12px; color: #8a8a8a; }
+
+/* ---------- 视频区 ---------- */
+.viewer {
+    flex: 1;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 16px;
+}
+.viewer figure {
+    width: 100%;
+    max-width: 1280px;
+    min-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+.viewer img {
+    width: 100%;
+    background: #000;
+    border-radius: 6px;
+    min-height: 240px;
+}
+/* 视频停止时隐藏画面(元素保留, 重启视频直接恢复) */
+.viewer img.off { display: none; }
+.viewer figcaption {
+    text-align: center;
+    font-size: 13px;
+    color: #8a8a8a;
+    padding: 8px 0;
+}
+.viewer figcaption:empty { display: none; }
+/* 视频停止时的居中占位卡片 */
+.viewer figcaption.placeholder {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    border: 1px dashed #4a4a4a;
+    border-radius: 12px;
+    padding: 44px 64px;
+    color: #8a8a8a;
+    font-size: 15px;
+    background: #1e1e1e;
+}
+/* 纯 CSS 画的小相机图标: 机身 + 镜头 */
+.viewer figcaption.placeholder::before {
+    content: "";
+    width: 48px;
+    height: 34px;
+    border: 2px solid #5a5a5a;
+    border-radius: 6px;
+    background: radial-gradient(circle at 50% 55%, #5a5a5a 0 5px, transparent 6px);
+}
+
+/* ---------- 窄屏适配 ---------- */
+@media (max-width: 768px) {
+    .container { flex-direction: column; }
+    .sidebar { width: 100%; }
+}

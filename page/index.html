@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>ESP32-CAM 摄像头控制台</title>
+    <link rel="stylesheet" href="/style.css?v=8">
+</head>
+<body>
+<div class="container">
+    <aside class="sidebar">
+        <h1>ESP32-CAM 摄像头</h1>
+
+        <div class="group">
+            <button id="toggle-stream" class="button">停止视频</button>
+            <button id="get-still" class="button">截 图</button>
+        </div>
+
+        <div class="group">
+            <label for="framesize">分辨率</label>
+            <select id="framesize" class="default-action">
+                <option value="1">QQVGA (160x120)</option>
+                <option value="5">QVGA (320x240)</option>
+                <option value="6">CIF (400x296)</option>
+                <option value="7">HVGA (480x320)</option>
+                <option value="8">VGA (640x480)</option>
+                <option value="9">SVGA (800x600)</option>
+                <option value="10">XGA (1024x768)</option>
+                <option value="11">HD (1280x720)</option>
+                <option value="12">SXGA (1280x1024)</option>
+                <option value="13">UXGA (1600x1200)</option>
+            </select>
+        </div>
+
+        <div class="group">
+            <label for="quality">画质 <span class="hint">(数值越小越清晰, 4~63)</span></label>
+            <div class="range-row">
+                <input type="range" id="quality" min="4" max="63" value="10" class="default-action">
+                <span id="quality-val" class="value">10</span>
+            </div>
+        </div>
+
+        <div class="group">
+            <label for="wb_mode">白平衡模式</label>
+            <select id="wb_mode" class="default-action">
+                <option value="0">自动</option>
+                <option value="1">晴天</option>
+                <option value="2">阴天</option>
+                <option value="3">办公室</option>
+                <option value="4">居家</option>
+            </select>
+        </div>
+
+        <div class="group">
+            <label for="led_intensity">LED 补光灯 <span id="led-val" class="value">0</span></label>
+            <div class="range-row">
+                <input type="range" id="led_intensity" min="0" max="255" value="0" class="default-action">
+                <button id="led-toggle" class="button small">开</button>
+            </div>
+        </div>
+
+        <div class="group">
+            <label>云台遥控</label>
+            <div class="ptz-pad">
+                <button class="ptz-btn ptz-up"    id="ptz-up"    aria-label="向上">&#9650;</button>
+                <button class="ptz-btn ptz-left"  id="ptz-left"  aria-label="向左">&#9664;</button>
+                <button class="ptz-btn ptz-talk"  id="ptz-talk"  aria-label="对话">对话</button>
+                <button class="ptz-btn ptz-right" id="ptz-right" aria-label="向右">&#9654;</button>
+                <button class="ptz-btn ptz-down"  id="ptz-down"  aria-label="向下">&#9660;</button>
+            </div>
+            <p class="hint">方向键: 按住移动, 松开停止; 中间键: 长按对话。</p>
+        </div>
+
+        <div class="group">
+            <label>录制</label>
+            <select id="rec-target" disabled>
+                <option value="nas" selected>存储到 NAS (局域网)</option>
+                <option value="sd" disabled>存储到 SD 卡 (与麦克风引脚冲突)</option>
+            </select>
+            <div class="rec-row">
+                <button id="rec-toggle" class="rec-btn">开始录制</button>
+                <span id="rec-status" class="rec-status">就绪</span>
+            </div>
+            <p class="hint">向 NAS 接收接口推送 MJPEG 流, 服务器地址在 src/hardware_config.h 中配置。</p>
+        </div>
+    </aside>
+
+    <main class="viewer">
+        <figure>
+            <img id="stream" alt="">
+            <figcaption id="viewer-hint">视频加载中, 请稍候…</figcaption>
+        </figure>
+    </main>
+</div>
+<script src="/script.js?v=10"></script>
+</body>
+</html>
