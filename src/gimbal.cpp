@@ -6,8 +6,8 @@
 // 1.5ms=停止(空挡), 1.0ms=全速正转, 2.0ms=全速反转, 中间值=对应速度
 // 舵机内部无位置反馈, 固件只控制"转多快/往哪转", 不知道"转到哪"
 // arduino 3.x LEDC 按"引脚"操作, 内部自动分配通道, 无需手动指定
-static const int PAN_PIN  = GIMBAL_PIN_PAN;
-static const int TILT_PIN = GIMBAL_PIN_TILT;
+static const int PAN_PIN  = GIMBAL_PIN_PAN;//水平轴
+static const int TILT_PIN = GIMBAL_PIN_TILT;//俯仰轴
 
 // 方向标志(位掩码), /ptz 接口与运动任务之间共享
 enum : uint8_t {
