@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
-
+//后续添加对话功能
 // 对话功能: INMP441 I2S 麦克风采集, 长按对话键时录音并以 WAV 流式 POST
 // 到 TALK_SERVER(hardware_config.h 配置); 松开按键结束上传。
 // 服务器未配置时仅打印串口日志(方便先接好硬件后逐项调试)。
