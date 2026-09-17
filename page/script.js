@@ -1,4 +1,4 @@
-// ===== ESP32-CAM 控制台脚本 =====
+﻿// ===== ESP32-CAM 控制台脚本 =====
 // 接口约定(与固件 app_httpd.cpp 对应):
 //   GET /status           -> JSON 状态
 //   GET /control?var=X&val=Y  -> 设置参数(framesize/quality/wb_mode/led_intensity)
