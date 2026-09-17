@@ -115,8 +115,8 @@ void begin()
     cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;   // INMP441 L/R 接 GND = 左声道
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count = 8;
-    cfg.dma_buf_len = 256;
+    cfg.dma_desc_num = 8;    // 旧名 dma_buf_count
+    cfg.dma_frame_num = 256; // 旧名 dma_buf_len
     cfg.use_apll = false;
 
     i2s_pin_config_t pins = {};
