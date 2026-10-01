@@ -16,10 +16,11 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "fb_gfx.h"
-#include "esp32-hal-ledc.h"
+#include "driver/ledc.h"
 #include "sdkconfig.h"
 #include <Arduino.h>
 #include <LittleFS.h>
+#include "camera_sync.h"
 #include "gimbal.h"
 #include "talk.h"
 #include "recorder.h"
@@ -81,10 +82,21 @@
 #if CONFIG_LED_ILLUMINATOR_ENABLED
 
 #define CONFIG_LED_MAX_INTENSITY 255
+#define LED_PWM_FREQ_HZ 5000
+
+// Keep the flash on a fixed LEDC resource. The camera uses high-speed
+// timer/channel 0; the two servos reserve timers 2 and 3. Using the Arduino
+// auto-allocation API here could silently pick timer 0 because the camera
+// driver is not registered with Arduino's LEDC bookkeeping.
+#define LED_PWM_MODE     LEDC_HIGH_SPEED_MODE
+#define LED_PWM_TIMER    LEDC_TIMER_1
+#define LED_PWM_CHANNEL  LEDC_CHANNEL_2
 
 int led_duty = 0;
-bool isStreaming = false;
-static int s_led_pin = -1;   // arduino 3.x LEDC 按引脚操作, 在 setupLedFlash 中记录
+volatile bool isStreaming = false;
+static int s_led_pin = -1;
+static bool s_led_pwm_ready = false;
+static int s_led_applied_duty = -1;
 
 #endif
 
@@ -101,6 +113,11 @@ static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
+
+// Each new stream invalidates the previous handler. This is only a connection
+// lifecycle guard; frames remain owned by the camera driver until they have
+// been sent, exactly as in the official CameraWebServer example.
+static volatile uint32_t stream_generation = 0;
 
 #if CONFIG_ESP_FACE_DETECT_ENABLED
 
@@ -287,15 +304,25 @@ static int run_face_recognition(fb_data_t *fb, std::list<dl::detect::result_t> *
 #if CONFIG_LED_ILLUMINATOR_ENABLED
 void enable_led(bool en)
 { // Turn LED On or Off
-    int duty = en ? led_duty : 0;
-    if (en && isStreaming && (led_duty > CONFIG_LED_MAX_INTENSITY))
-    {
-        duty = CONFIG_LED_MAX_INTENSITY;
+    const int duty = en ? constrain(led_duty, 0, CONFIG_LED_MAX_INTENSITY) : 0;
+
+    if (s_led_pwm_ready) {
+        // ESP32 LEDC uses one extra duty value for 100% output at 8-bit
+        // resolution. This is the same full-on handling used by Arduino's
+        // ledcWrite() wrapper.
+        const uint32_t pwm_duty = (duty >= CONFIG_LED_MAX_INTENSITY) ? 256U : (uint32_t)duty;
+        if (ledc_set_duty(LED_PWM_MODE, LED_PWM_CHANNEL, pwm_duty) == ESP_OK) {
+            ledc_update_duty(LED_PWM_MODE, LED_PWM_CHANNEL);
+        }
+    } else {
+        // A failed PWM setup must never prevent the camera from working.
+        digitalWrite(s_led_pin, duty > 0 ? HIGH : LOW);
     }
-    ledcWrite(s_led_pin, duty);
-    //ledc_set_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL, duty);
-    //ledc_update_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL);
-    log_i("Set LED intensity to %d", duty);
+
+    if (duty != s_led_applied_duty) {
+        s_led_applied_duty = duty;
+        log_i("Set LED intensity to %d", duty);
+    }
 }
 #endif
 
@@ -321,6 +348,12 @@ static esp_err_t capture_handler(httpd_req_t *req)
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
     int64_t fr_start = esp_timer_get_time();
 #endif
+
+    camera_sync::LockGuard camera_lock(5000);
+    if (!camera_lock.locked()) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
 #if CONFIG_LED_ILLUMINATOR_ENABLED
     enable_led(true);
@@ -423,6 +456,7 @@ static esp_err_t capture_handler(httpd_req_t *req)
         out_buf = (uint8_t*)malloc(out_len);
         if (!out_buf) {
             log_e("out_buf malloc failed");
+            esp_camera_fb_return(fb);
             httpd_resp_send_500(req);
             return ESP_FAIL;
         }
@@ -481,278 +515,101 @@ static esp_err_t capture_handler(httpd_req_t *req)
 #endif
 }
 
+// Official CameraWebServer-style MJPEG stream.
+// The camera frame remains in the driver buffer until the multipart frame has
+// been sent. This is deliberately simple: no per-frame malloc, JPEG copy,
+// retry loop, or frame queue is involved.
 static esp_err_t stream_handler(httpd_req_t *req)
 {
     camera_fb_t *fb = NULL;
-    struct timeval _timestamp;
-    esp_err_t res = ESP_OK;
-    size_t _jpg_buf_len = 0;
-    uint8_t *_jpg_buf = NULL;
-    char *part_buf[128];
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        bool detected = false;
-        int64_t fr_ready = 0;
-        int64_t fr_recognize = 0;
-        int64_t fr_encode = 0;
-        int64_t fr_face = 0;
-        int64_t fr_start = 0;
-    #endif
-    int face_id = 0;
-    size_t out_len = 0, out_width = 0, out_height = 0;
-    uint8_t *out_buf = NULL;
-    bool s = false;
-#if TWO_STAGE
-    HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
-    HumanFaceDetectMNP01 s2(0.5F, 0.3F, 5);
-#else
-    HumanFaceDetectMSR01 s1(0.3F, 0.5F, 10, 0.2F);
-#endif
-#endif
+    struct timeval timestamp;
+    size_t jpg_len = 0;
+    uint8_t *jpg_buf = NULL;
+    char part_buf[128];
+    esp_err_t res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    const uint32_t my_generation = ++stream_generation;
 
-    static int64_t last_frame = 0;
-    if (!last_frame)
-    {
-        last_frame = esp_timer_get_time();
-    }
-
-    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-    if (res != ESP_OK)
-    {
+    if (res != ESP_OK) {
         return res;
     }
 
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "X-Framerate", "60");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+    httpd_resp_set_hdr(req, "X-Framerate", "30");
 
 #if CONFIG_LED_ILLUMINATOR_ENABLED
     isStreaming = true;
     enable_led(true);
 #endif
 
-    while (true)
-    {
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        detected = false;
-    #endif
-        face_id = 0;
-#endif
+    while (true) {
+        if (my_generation != stream_generation) {
+            res = ESP_FAIL;
+            break;
+        }
+
+        camera_sync::LockGuard camera_lock(5000);
+        if (!camera_lock.locked()) {
+            log_e("Camera lock timeout");
+            res = ESP_FAIL;
+            break;
+        }
 
         fb = esp_camera_fb_get();
-        if (!fb)
-        {
+        if (!fb) {
             log_e("Camera capture failed");
             res = ESP_FAIL;
-        }
-        else
-        {
-            _timestamp.tv_sec = fb->timestamp.tv_sec;
-            _timestamp.tv_usec = fb->timestamp.tv_usec;
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-            fr_start = esp_timer_get_time();
-            fr_ready = fr_start;
-            fr_encode = fr_start;
-            fr_recognize = fr_start;
-            fr_face = fr_start;
-    #endif
-            if (!detection_enabled || fb->width > 400)
-            {
-#endif
-                if (fb->format != PIXFORMAT_JPEG)
-                {
-                    bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-                    esp_camera_fb_return(fb);
-                    fb = NULL;
-                    if (!jpeg_converted)
-                    {
-                        log_e("JPEG compression failed");
-                        res = ESP_FAIL;
-                    }
+        } else {
+            timestamp.tv_sec = fb->timestamp.tv_sec;
+            timestamp.tv_usec = fb->timestamp.tv_usec;
+
+            if (fb->format != PIXFORMAT_JPEG) {
+                const bool converted = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
+                esp_camera_fb_return(fb);
+                fb = NULL;
+                if (!converted) {
+                    log_e("JPEG compression failed");
+                    res = ESP_FAIL;
                 }
-                else
-                {
-                    _jpg_buf_len = fb->len;
-                    _jpg_buf = fb->buf;
-                }
-#if CONFIG_ESP_FACE_DETECT_ENABLED
+            } else {
+                jpg_len = fb->len;
+                jpg_buf = fb->buf;
             }
-            else
-            {
-                if (fb->format == PIXFORMAT_RGB565
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-                    && !recognition_enabled
-#endif
-                ){
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                    fr_ready = esp_timer_get_time();
-#endif
-#if TWO_STAGE
-                    std::list<dl::detect::result_t> &candidates = s1.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3});
-                    std::list<dl::detect::result_t> &results = s2.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3}, candidates);
-#else
-                    std::list<dl::detect::result_t> &results = s1.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3});
-#endif
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                    fr_face = esp_timer_get_time();
-                    fr_recognize = fr_face;
-#endif
-                    if (results.size() > 0) {
-                        fb_data_t rfb;
-                        rfb.width = fb->width;
-                        rfb.height = fb->height;
-                        rfb.data = fb->buf;
-                        rfb.bytes_per_pixel = 2;
-                        rfb.format = FB_RGB565;
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                        detected = true;
-#endif
-                        draw_face_boxes(&rfb, &results, face_id);
-                    }
-                    s = fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 80, &_jpg_buf, &_jpg_buf_len);
-                    esp_camera_fb_return(fb);
-                    fb = NULL;
-                    if (!s) {
-                        log_e("fmt2jpg failed");
-                        res = ESP_FAIL;
-                    }
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                    fr_encode = esp_timer_get_time();
-#endif
-                } else
-                {
-                    out_len = fb->width * fb->height * 3;
-                    out_width = fb->width;
-                    out_height = fb->height;
-                    out_buf = (uint8_t*)malloc(out_len);
-                    if (!out_buf) {
-                        log_e("out_buf malloc failed");
-                        res = ESP_FAIL;
-                    } else {
-                        s = fmt2rgb888(fb->buf, fb->len, fb->format, out_buf);
-                        esp_camera_fb_return(fb);
-                        fb = NULL;
-                        if (!s) {
-                            free(out_buf);
-                            log_e("To rgb888 failed");
-                            res = ESP_FAIL;
-                        } else {
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                            fr_ready = esp_timer_get_time();
-#endif
-
-                            fb_data_t rfb;
-                            rfb.width = out_width;
-                            rfb.height = out_height;
-                            rfb.data = out_buf;
-                            rfb.bytes_per_pixel = 3;
-                            rfb.format = FB_BGR888;
-
-#if TWO_STAGE
-                            std::list<dl::detect::result_t> &candidates = s1.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3});
-                            std::list<dl::detect::result_t> &results = s2.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3}, candidates);
-#else
-                            std::list<dl::detect::result_t> &results = s1.infer((uint8_t *)out_buf, {(int)out_height, (int)out_width, 3});
-#endif
-
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                            fr_face = esp_timer_get_time();
-                            fr_recognize = fr_face;
-#endif
-
-                            if (results.size() > 0) {
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                                detected = true;
-#endif
-#if CONFIG_ESP_FACE_RECOGNITION_ENABLED
-                                if (recognition_enabled) {
-                                    face_id = run_face_recognition(&rfb, &results);
-    #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                                    fr_recognize = esp_timer_get_time();
-    #endif
-                                }
-#endif
-                                draw_face_boxes(&rfb, &results, face_id);
-                            }
-                            s = fmt2jpg(out_buf, out_len, out_width, out_height, PIXFORMAT_RGB888, 90, &_jpg_buf, &_jpg_buf_len);
-                            free(out_buf);
-                            if (!s) {
-                                log_e("fmt2jpg failed");
-                                res = ESP_FAIL;
-                            }
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-                            fr_encode = esp_timer_get_time();
-#endif
-                        }
-                    }
-                }
-            }
-#endif
         }
-        if (res == ESP_OK)
-        {
+
+        if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
         }
-        if (res == ESP_OK)
-        {
-            size_t hlen = snprintf((char *)part_buf, 128, _STREAM_PART, _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
-            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+        if (res == ESP_OK) {
+            const size_t header_len = snprintf(
+                part_buf, sizeof(part_buf), _STREAM_PART, (unsigned)jpg_len,
+                (int)timestamp.tv_sec, (int)timestamp.tv_usec);
+            res = httpd_resp_send_chunk(req, part_buf, header_len);
         }
-        if (res == ESP_OK)
-        {
-            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_len);
         }
-        if (fb)
-        {
+
+        if (fb) {
             esp_camera_fb_return(fb);
             fb = NULL;
-            _jpg_buf = NULL;
+            jpg_buf = NULL;
+        } else if (jpg_buf) {
+            free(jpg_buf);
+            jpg_buf = NULL;
         }
-        else if (_jpg_buf)
-        {
-            free(_jpg_buf);
-            _jpg_buf = NULL;
-        }
-        if (res != ESP_OK)
-        {
+
+        if (res != ESP_OK) {
             log_e("Send frame failed");
             break;
         }
-        int64_t fr_end = esp_timer_get_time();
-
-#if CONFIG_ESP_FACE_DETECT_ENABLED && ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        int64_t ready_time = (fr_ready - fr_start) / 1000;
-        int64_t face_time = (fr_face - fr_ready) / 1000;
-        int64_t recognize_time = (fr_recognize - fr_face) / 1000;
-        int64_t encode_time = (fr_encode - fr_recognize) / 1000;
-        int64_t process_time = (fr_encode - fr_start) / 1000;
-#endif
-
-        int64_t frame_time = fr_end - last_frame;
-        frame_time /= 1000;
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
-        uint32_t avg_frame_time = ra_filter_run(&ra_filter, frame_time);
-#endif
-        log_i("MJPG: %uB %ums (%.1ffps), AVG: %ums (%.1ffps)"
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-                      ", %u+%u+%u+%u=%u %s%d"
-#endif
-                 ,
-                 (uint32_t)(_jpg_buf_len),
-                 (uint32_t)frame_time, 1000.0 / (uint32_t)frame_time,
-                 avg_frame_time, 1000.0 / avg_frame_time
-#if CONFIG_ESP_FACE_DETECT_ENABLED
-                 ,
-                 (uint32_t)ready_time, (uint32_t)face_time, (uint32_t)recognize_time, (uint32_t)encode_time, (uint32_t)process_time,
-                 (detected) ? "DETECTED " : "", face_id
-#endif
-        );
     }
 
 #if CONFIG_LED_ILLUMINATOR_ENABLED
-    isStreaming = false;
-    enable_led(false);
+    if (my_generation == stream_generation) {
+        isStreaming = false;
+        enable_led(false);
+    }
 #endif
 
     return res;
@@ -802,9 +659,16 @@ static esp_err_t cmd_handler(httpd_req_t *req)
     sensor_t *s = esp_camera_sensor_get();
     int res = 0;
 
+    camera_sync::LockGuard camera_lock(5000);
+    if (!camera_lock.locked()) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
     if (!strcmp(variable, "framesize")) {
         if (s->pixformat == PIXFORMAT_JPEG) {
             res = s->set_framesize(s, (framesize_t)val);
+            log_i("framesize request=%d result=%d active=%d", val, res, s->status.framesize);
         }
     }
     else if (!strcmp(variable, "quality"))
@@ -855,7 +719,7 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         res = s->set_ae_level(s, val);
 #if CONFIG_LED_ILLUMINATOR_ENABLED
     else if (!strcmp(variable, "led_intensity")) {
-        led_duty = val;
+        led_duty = constrain(val, 0, CONFIG_LED_MAX_INTENSITY);
         if (isStreaming)
             enable_led(true);
     }
@@ -964,7 +828,7 @@ static esp_err_t status_handler(httpd_req_t *req)
     p += sprintf(p, "\"dcw\":%u,", s->status.dcw);
     p += sprintf(p, "\"colorbar\":%u", s->status.colorbar);
 #if CONFIG_LED_ILLUMINATOR_ENABLED
-    p += sprintf(p, ",\"led_intensity\":%u", led_duty);
+    p += sprintf(p, ",\"led_intensity\":%d", led_duty);
 #else
     p += sprintf(p, ",\"led_intensity\":%d", -1);
 #endif
@@ -1014,7 +878,7 @@ static bool parse_get_str(char *buf, const char *key, char *out, size_t outlen)
 
 // ===== 云台遥控 =====
 // 协议: GET /ptz?dir=up|down|left|right|talk&action=down|up
-//   方向键: action=down 按下开始移动, action=up 松开停止 -> 舵机
+//   方向键: action=down 按下开始调整, action=up 松开停止 -> 舵机
 //   中间键(对话): action=down 长按开始说话, action=up 松开结束 -> 麦克风
 static void ptz_apply(const char *dir, const char *action)
 {
@@ -1079,6 +943,17 @@ static esp_err_t rec_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, msg, strlen(msg));
+}
+
+static esp_err_t stream_stop_handler(httpd_req_t *req)
+{
+    ++stream_generation;
+#if CONFIG_LED_ILLUMINATOR_ENABLED
+    isStreaming = false;
+    enable_led(false);
+#endif
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 // 通用静态文件处理器: 从 LittleFS 读取网页文件, 按 1KB 分块发送
@@ -1215,6 +1090,13 @@ void startCameraServer()
         .user_ctx = NULL
     };
 
+    httpd_uri_t stream_stop_uri = {
+        .uri = "/stop",
+        .method = HTTP_GET,
+        .handler = stream_stop_handler,
+        .user_ctx = NULL
+    };
+
     ra_filter_init(&ra_filter, 20);
 
 #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
@@ -1235,6 +1117,7 @@ void startCameraServer()
 
         httpd_register_uri_handler(camera_httpd, &ptz_uri);
         httpd_register_uri_handler(camera_httpd, &rec_uri);
+        httpd_register_uri_handler(camera_httpd, &stream_stop_uri);
     }
 
     config.server_port += 1;
@@ -1249,10 +1132,43 @@ void startCameraServer()
 void setupLedFlash(int pin) 
 {
     #if CONFIG_LED_ILLUMINATOR_ENABLED
-    // arduino 3.x 新 API: 直接绑定引脚(内部自动分配 LEDC 通道/定时器)
     s_led_pin = pin;
-    ledcAttach(pin, 5000, 8);
-    ledcWrite(pin, 0);
+
+    // Configure the LED directly through ESP-IDF so Timer 1 is explicit.
+    // ledcAttach()/ledcAttachChannel() chooses a free timer by Arduino's
+    // bookkeeping and cannot see the camera driver's Timer 0 reservation.
+    ledc_timer_config_t timer_config = {};
+    timer_config.speed_mode = LED_PWM_MODE;
+    timer_config.timer_num = LED_PWM_TIMER;
+    timer_config.duty_resolution = LEDC_TIMER_8_BIT;
+    timer_config.freq_hz = LED_PWM_FREQ_HZ;
+    timer_config.clk_cfg = LEDC_AUTO_CLK;
+
+    ledc_channel_config_t channel_config = {};
+    channel_config.gpio_num = static_cast<gpio_num_t>(pin);
+    channel_config.speed_mode = LED_PWM_MODE;
+    channel_config.channel = LED_PWM_CHANNEL;
+    channel_config.intr_type = LEDC_INTR_DISABLE;
+    channel_config.timer_sel = LED_PWM_TIMER;
+    channel_config.duty = 0;
+    channel_config.hpoint = 0;
+
+    const esp_err_t timer_res = ledc_timer_config(&timer_config);
+    const esp_err_t channel_res = (timer_res == ESP_OK)
+        ? ledc_channel_config(&channel_config)
+        : timer_res;
+
+    if (channel_res == ESP_OK) {
+        s_led_pwm_ready = true;
+        s_led_applied_duty = 0;
+        log_i("LED flash PWM ready: GPIO%d, %dHz, 8-bit, LEDC timer %d/channel %d",
+              pin, LED_PWM_FREQ_HZ, LED_PWM_TIMER, LED_PWM_CHANNEL);
+    } else {
+        s_led_pwm_ready = false;
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, LOW);
+        log_w("LED flash PWM unavailable (0x%x), using digital on/off fallback", channel_res);
+    }
     #else
     log_i("LED flash is disabled -> CONFIG_LED_ILLUMINATOR_ENABLED = 0");
     #endif

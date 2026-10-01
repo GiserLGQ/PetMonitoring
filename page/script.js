@@ -9,7 +9,7 @@
 
 const $ = (id) => document.getElementById(id);
 
-console.log('[ESP32-CAM] script.js v10 已加载'); // 用于确认浏览器没有使用缓存的旧脚本
+console.log('[ESP32-CAM] script.js v13 已加载'); // 用于确认浏览器没有使用缓存的旧脚本
 
 // 视频流在独立的 81 端口(esp-idf httpd 每端口单线程, 流会占死所在端口,
 // 因此控制接口用 80 端口、视频流专用 81 端口, 与官方示例一致)
@@ -23,44 +23,31 @@ const STREAM_URL = IS_LAN
     ? location.protocol + '//' + location.hostname + ':81/stream'
     : location.origin + '/stream';
 
-// ---------- 快照降级模式 ----------
-// 流不可用时(隧道未配 /stream 规则、连接被中间设备掐断等),
-// 自动改为每 350ms 拉一帧 /capture 单图, 画面变慢(约3FPS)但不至于黑屏
-let snapTimer = null;
+let streamStopPromise = Promise.resolve();
+let framesizeChangePromise = Promise.resolve();
+let streamUiGeneration = 0;
 
-function stopSnap() {
-    if (snapTimer) { clearInterval(snapTimer); snapTimer = null; }
-    const img = $('stream');
-    if (img.dataset.snapUrl) {
-        URL.revokeObjectURL(img.dataset.snapUrl);
-        delete img.dataset.snapUrl;
-    }
-}
-
-function startSnap() {
-    if (snapTimer) return;
-    console.warn('[ESP32-CAM] 视频流不可用, 降级为快照模式(约3FPS)');
-    const pull = () => fetch('/capture')
-        .then(r => { if (!r.ok) throw new Error(r.status); return r.blob(); })
-        .then(b => {
-            if (!streaming) return;
-            const img = $('stream');
-            if (img.dataset.snapUrl) URL.revokeObjectURL(img.dataset.snapUrl);
-            img.dataset.snapUrl = URL.createObjectURL(b);
-            img.src = img.dataset.snapUrl;
-            $('viewer-hint').textContent = '快照模式(视频流降级)';
-        })
-        .catch(() => {});   // 静默重试
-    pull();
-    snapTimer = setInterval(pull, 350);
+function requestStreamStop() {
+    // Serialize stop requests. If a stop and a new start overlap, the late
+    // stop must not invalidate the newly created stream.
+    streamStopPromise = streamStopPromise
+        .catch(() => {})
+        .then(() => fetch('/stop'))
+        .catch(() => {});
+    return streamStopPromise;
 }
 
 // ---------- 通用: 发送控制命令 ----------
 function send(varName, val) {
-    fetch('/control?var=' + encodeURIComponent(varName) + '&val=' + encodeURIComponent(val))
-        .then(r => r.text())
-        .then(t => { if (t.trim() !== '' && t.trim() !== '1') console.warn('设置失败:', varName, '=', val, '返回:', t); })
-        .catch(err => console.warn('网络错误:', err));
+    return fetch('/control?var=' + encodeURIComponent(varName) + '&val=' + encodeURIComponent(val))
+        .then(r => r.text().then(t => {
+            if (!r.ok) throw new Error(t || ('HTTP ' + r.status));
+            if (t.trim() !== '' && t.trim() !== '1') console.warn('设置失败:', varName, '=', val, '返回:', t);
+        }))
+        .catch(err => {
+            console.warn('设置失败:', varName, '=', val, err);
+            throw err;
+        });
 }
 
 // ---------- 视频流 启动/停止 ----------
@@ -91,17 +78,23 @@ function resetIdleTimer() {
 function applyStream() {
     const img = $('stream');
     const hint = $('viewer-hint');
+    const generation = ++streamUiGeneration;
     if (streaming) {
-        stopSnap();
         img.classList.remove('off');
         hint.classList.add('placeholder');
         hint.textContent = '视频加载中, 请稍候…';
-        img.src = STREAM_URL;
-        resetIdleTimer();
+        requestStreamStop().then(() => {
+            if (!streaming || generation !== streamUiGeneration) return;
+            const cacheBust = (STREAM_URL.includes('?') ? '&' : '?') + 't=' + Date.now();
+            img.src = STREAM_URL + cacheBust;
+            resetIdleTimer();
+        });
     } else {
-        stopSnap();
         stopIdleTimer();
+        // Close the browser socket first. /stop then invalidates the server's
+        // current handler before the next resolution change or start.
         img.src = '';
+        requestStreamStop();
         img.classList.add('off');
         hint.classList.remove('placeholder');
         hint.textContent = '视频已停止';
@@ -114,50 +107,78 @@ $('toggle-stream').onclick = () => {
     applyStream();
 };
 
-// 流意外断开(如路由器重启、隧道断流)时: 保持播放状态, 降级为快照轮询
+// 流意外断开时只提示错误，不启动第二个 /capture 消费者。
 $('stream').onerror = () => {
-    if (streaming) startSnap();
+    if (streaming) $('viewer-hint').textContent = '视频流连接失败, 请重新启动视频';
 };
-// 视频成功加载后: 停掉快照模式, 清除提示文字(实时流优先)
+// 视频开始显示后清除加载提示。
 $('stream').onload = () => {
-    if (streaming) { stopSnap(); $('viewer-hint').textContent = ''; }
+    if (streaming) $('viewer-hint').textContent = '';
 };
 
 // ---------- 截图 ----------
 $('get-still').onclick = () => window.open('/capture');
 
 // ---------- 分辨率 ----------
-$('framesize').onchange = (e) => send('framesize', e.target.value);
+$('framesize').onchange = (e) => {
+    const requestedSize = e.target.value;
+    framesizeChangePromise = framesizeChangePromise.then(async () => {
+        const wasStreaming = streaming;
+        if (wasStreaming) {
+            // A sensor mode switch can invalidate the current MJPEG frame
+            // boundary. Close the old stream before changing framesize, then
+            // start a clean stream after the control request completes.
+            streaming = false;
+            applyStream();
+            await streamStopPromise;
+        }
+
+        try {
+            await send('framesize', requestedSize);
+            // Let the sensor and DMA pipeline settle before the first new frame.
+            await new Promise(resolve => setTimeout(resolve, 250));
+        } finally {
+            if (wasStreaming) {
+                streaming = true;
+                applyStream();
+            }
+        }
+    }).catch(err => console.warn('分辨率切换失败:', err));
+};
 
 // ---------- 画质 ----------
 $('quality').oninput = (e) => { $('quality-val').textContent = e.target.value; };
-$('quality').onchange = (e) => send('quality', e.target.value);
+$('quality').onchange = (e) => send('quality', e.target.value).catch(() => {});
 
 // ---------- 白平衡模式 ----------
-$('wb_mode').onchange = (e) => send('wb_mode', e.target.value);
+$('wb_mode').onchange = (e) => send('wb_mode', e.target.value).catch(() => {});
 
 // ---------- LED 补光灯 ----------
 let ledOn = false;
+let lastLedDuty = 255;
 
 $('led_intensity').oninput = (e) => {
     $('led-val').textContent = e.target.value;
 };
 $('led_intensity').onchange = (e) => {
-    ledOn = Number(e.target.value) > 0;
+    const duty = Number(e.target.value);
+    ledOn = duty > 0;
+    if (ledOn) lastLedDuty = duty;
     $('led-toggle').textContent = ledOn ? '关' : '开';
-    send('led_intensity', e.target.value);
+    send('led_intensity', duty).catch(() => {});
 };
 $('led-toggle').onclick = () => {
     ledOn = !ledOn;
-    const duty = ledOn ? 255 : 0;
+    const duty = ledOn ? (lastLedDuty || 255) : 0;
     $('led_intensity').value = duty;
     $('led-val').textContent = duty;
+    if (ledOn) lastLedDuty = duty;
     $('led-toggle').textContent = ledOn ? '关' : '开';
-    send('led_intensity', duty);
+    send('led_intensity', duty).catch(() => {});
 };
 
 // ---------- 云台遥控 ----------
-// 方向键: 按住发 action=down, 松开发 action=up (后期固件里驱动舵机)
+// 方向键: 按住发 action=down, 松开发 action=up (连续旋转舵机速度控制)
 // 对话键: 长按开始(action=down), 松开结束(action=up)
 function ptzSend(dir, action) {
     fetch('/ptz?dir=' + dir + '&action=' + action)
@@ -245,9 +266,11 @@ fetch('/status')
         }
         if (s.wb_mode !== undefined) $('wb_mode').value = s.wb_mode;
         if (s.led_intensity !== undefined && s.led_intensity >= 0) {
-            $('led_intensity').value = s.led_intensity;
-            $('led-val').textContent = s.led_intensity;
-            ledOn = Number(s.led_intensity) > 0;
+            const duty = Number(s.led_intensity);
+            $('led_intensity').value = duty;
+            $('led-val').textContent = duty;
+            ledOn = duty > 0;
+            if (ledOn) lastLedDuty = duty;
             $('led-toggle').textContent = ledOn ? '关' : '开';
         }
         if (s.recording !== undefined) {

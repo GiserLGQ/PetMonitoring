@@ -14,6 +14,7 @@
 
 // 摄像头引脚等全部硬件引脚定义统一在 hardware_config.h
 #include "hardware_config.h"
+#include "camera_sync.h"
 #include "gimbal.h"
 #include "talk.h"
 #include "recorder.h"
@@ -39,7 +40,14 @@ void setup() {
     Serial.println("LittleFS mount failed! 请先执行 'pio run -t uploadfs' 上传网页文件");
   }
 
-  camera_config_t config;
+  // Reserve the servo PWM timers before the camera claims LEDC timer 0.
+  // This ordering is required by the ESP32-CAM + SG90 reference design.
+  gimbal::begin();
+  camera_sync::begin();
+
+  // Clear the whole structure so fields added by newer esp32-camera versions
+  // never contain stack garbage.
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM;
@@ -58,7 +66,9 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  // Match the official CameraWebServer sensor clock. Camera XCLK owns LEDC
+  // timer 0; LED flash uses timer 1 and servos use timers 2/3.
+  config.xclk_freq_hz = CAMERA_XCLK_FREQ_HZ;
   config.frame_size = FRAMESIZE_UXGA;
   config.pixel_format = PIXFORMAT_JPEG; // for streaming
   //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
@@ -71,6 +81,8 @@ void setup() {
   //                      for larger pre-allocated frame buffer.
   if(config.pixel_format == PIXFORMAT_JPEG){
     if(psramFound()){
+      // Official PSRAM path: two buffers keep capture continuous while the
+      // single stream client is sending the previous JPEG.
       config.jpeg_quality = 10;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
@@ -106,7 +118,7 @@ void setup() {
     s->set_framesize(s, FRAMESIZE_QVGA);
   }
 
-  // 板载白色闪光灯 PWM 补光
+  // 板载白色闪光灯 PWM 补光(GPIO4, LEDC Timer 1)
   setupLedFlash(LED_GPIO_NUM);
 
   WiFi.begin(ssid, password);
@@ -120,8 +132,7 @@ void setup() {
 
   startCameraServer();
 
-  // 云台舵机 / 对话麦克风 / NAS 录制 (引脚见 hardware_config.h)
-  gimbal::begin();
+  // 对话麦克风 / NAS 录制 (引脚见 hardware_config.h)
   talk::begin();
   recorder::begin();
 

@@ -10,6 +10,7 @@
 #define PWDN_GPIO_NUM    32    // 摄像头掉电控制
 #define RESET_GPIO_NUM   -1    // 复位(本板未接)
 #define XCLK_GPIO_NUM     0    // 外部时钟
+#define CAMERA_XCLK_FREQ_HZ 20000000 // 官方 CameraWebServer 默认时钟
 #define SIOD_GPIO_NUM    26    // SCCB 数据(摄像头寄存器配置)
 #define SIOC_GPIO_NUM    27    // SCCB 时钟
 #define Y9_GPIO_NUM      35    // 8 位并行数据总线 D7
@@ -23,18 +24,21 @@
 #define VSYNC_GPIO_NUM   25    // 帧同步
 #define HREF_GPIO_NUM    23    // 行参考
 #define PCLK_GPIO_NUM    22    // 像素时钟
-#define LED_GPIO_NUM      4    // 板载白色闪光灯(PWM 补光)
+#define LED_GPIO_NUM      4    // 板载白色闪光灯(PWM 0~255 调光，LEDC Timer 1)
 
-// ---------------- 云台舵机 (360°连续旋转舵机, 50Hz PWM) ----------------
+// ---------------- 云台舵机 (SG90 360°连续旋转, 50Hz PWM) ----------------
 // 接线: 棕=GND, 红=5V(独立供电!), 橙/黄=信号
 // 警告: 舵机务必用独立 5V 电源(≥2A), 与板子共地, 不要从 ESP32-CAM 取电
-// 360°舵机没有角度概念, 脉宽=油门: 1.5ms=停止, 1.0ms=全速正转, 2.0ms=全速反转
-// 按住方向键=转动, 松手=刹车; 俯仰轴无位置反馈, 机械极限处请勿长时间按住(堵转易烧舵机)
+// 连续旋转舵机没有绝对角度；1500us停止，偏离中心控制方向和速度
 #define GIMBAL_PIN_PAN    13    // 左右(水平)舵机信号线
 #define GIMBAL_PIN_TILT   12    // 上下(垂直)舵机信号线
 // 注意: GPIO12 是启动 strap 引脚(上电时为高会导致 Flash 电压错误无法启动),
 // 舵机信号线是输入不驱动电平, 正常接线无影响; 但切勿在 GPIO12 上接上拉电阻
-#define GIMBAL_SPEED     55    // 按住时的转速(0~100, 百分比; 55=中速, 100=全速)
+#define GIMBAL_SPEED    55     // 按住时速度(0~100)，1500us为停止
+#define GIMBAL_PAN_STOP_US  1500 // 水平轴停止脉宽，舵机慢转时微调
+#define GIMBAL_TILT_STOP_US 1500 // 垂直轴停止脉宽，舵机慢转时微调
+#define GIMBAL_PAN_DIRECTION  1  // 改为 -1 可反转水平轴
+#define GIMBAL_TILT_DIRECTION 1  // 改为 -1 可反转垂直轴
 
 // ---------------- INMP441 I2S 数字麦克风 (对话用) ----------------
 // 接线: VDD=3.3V, GND=GND, L/R=GND(左声道), SCK/CLK=BCLK, WS=LRCL, SD=DOUT

@@ -1,54 +1,72 @@
 #include "gimbal.h"
 #include "hardware_config.h"
-#include "esp32-hal-ledc.h"
+#include <ESP32Servo.h>
 
-// 360°连续旋转舵机: 周期 50Hz(20ms), 脉宽=油门(不是角度!)
-// 1.5ms=停止(空挡), 1.0ms=全速正转, 2.0ms=全速反转, 中间值=对应速度
-// 舵机内部无位置反馈, 固件只控制"转多快/往哪转", 不知道"转到哪"
-// arduino 3.x LEDC 按"引脚"操作, 内部自动分配通道, 无需手动指定
-static const int PAN_PIN  = GIMBAL_PIN_PAN;//水平轴
-static const int TILT_PIN = GIMBAL_PIN_TILT;//俯仰轴
+// The SG90 variant used here is a continuous-rotation servo. It has no
+// absolute angle; the pulse width around the calibrated stop value controls
+// direction and speed.
+static Servo s_pan_servo;
+static Servo s_tilt_servo;
+static volatile uint8_t s_flags = 0;
 
-// 方向标志(位掩码), /ptz 接口与运动任务之间共享
 enum : uint8_t {
     DIR_UP    = 1 << 0,
     DIR_DOWN  = 1 << 1,
     DIR_LEFT  = 1 << 2,
     DIR_RIGHT = 1 << 3,
 };
-static volatile uint8_t s_flags = 0;
 
-static inline uint32_t speedToDuty(float percent)
+static int velocityPulse(int stop_us, int direction)
 {
-    // 速度(-100~+100) -> 脉宽(1000~2000us, 1500为空挡) -> 16 位占空比
-    if (percent < -100) percent = -100;
-    if (percent >  100) percent =  100;
-    int us = 1500 + (int)(percent * 5.0f);
-    return (uint32_t)us * 65536UL / 20000UL;
+    // GIMBAL_SPEED is a percentage. A 275us offset is a practical starting
+    // point for continuous SG90 servos and remains inside the safe range.
+    const int pulse = stop_us + direction * GIMBAL_SPEED * 5;
+    return constrain(pulse, 1000, 2000);
 }
 
-static void writePan(float v)
+static void startServo(Servo &servo, int pin, int pulse_us)
 {
-    ledcWrite(PAN_PIN, speedToDuty(v));
+    if (!servo.attached()) {
+        servo.attach(pin, 500, 2400);
+    }
+    servo.writeMicroseconds(pulse_us);
 }
 
-static void writeTilt(float v)
+static void stopServo(Servo &servo, int stop_us)
 {
-    ledcWrite(TILT_PIN, speedToDuty(v));
+    if (servo.attached()) {
+        // Keep sending the neutral pulse. Detaching immediately after this
+        // write may remove the signal before a continuous-rotation servo sees
+        // a complete stop command; the servo timers are isolated from camera
+        // and flash timers, so idle PWM is safe to leave attached.
+        servo.writeMicroseconds(stop_us);
+    }
 }
 
-// 运动任务: 每 20ms 根据按住的方向输出"油门", 松手输出 0(空挡刹车)
+static void updateAxis(Servo &servo, int pin, int stop_us, int direction)
+{
+    if (direction == 0) {
+        stopServo(servo, stop_us);
+        return;
+    }
+
+    startServo(servo, pin, velocityPulse(stop_us, direction));
+}
+
 static void gimbalTask(void *)
 {
     for (;;) {
-        uint8_t f = s_flags;
-        float panV = 0, tiltV = 0;
-        if (f & DIR_LEFT)  panV -= GIMBAL_SPEED;
-        if (f & DIR_RIGHT) panV += GIMBAL_SPEED;
-        if (f & DIR_UP)    tiltV -= GIMBAL_SPEED;  // 上=抬头
-        if (f & DIR_DOWN)  tiltV += GIMBAL_SPEED;
-        writePan(panV);
-        writeTilt(tiltV);
+        const uint8_t flags = s_flags;
+        int pan_direction = 0;
+        int tilt_direction = 0;
+
+        if (flags & DIR_LEFT)  pan_direction--;
+        if (flags & DIR_RIGHT) pan_direction++;
+        if (flags & DIR_UP)    tilt_direction--;
+        if (flags & DIR_DOWN)  tilt_direction++;
+
+        updateAxis(s_pan_servo, GIMBAL_PIN_PAN, GIMBAL_PAN_STOP_US, pan_direction * GIMBAL_PAN_DIRECTION);
+        updateAxis(s_tilt_servo, GIMBAL_PIN_TILT, GIMBAL_TILT_STOP_US, tilt_direction * GIMBAL_TILT_DIRECTION);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -57,26 +75,33 @@ namespace gimbal {
 
 void begin()
 {
-    ledcAttach(PAN_PIN, 50, 16);
-    ledcAttach(TILT_PIN, 50, 16);
-    writePan(0);   // 上电空挡: 两个舵机立刻刹车
-    writeTilt(0);
+    // Camera XCLK owns LEDC timer 0 and the flash owns timer 1. Explicitly
+    // reserve only timers 2 and 3 for ESP32Servo before the camera starts.
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+    s_pan_servo.setPeriodHertz(50);
+    s_tilt_servo.setPeriodHertz(50);
+
+    // No servo is attached at boot; the first PTZ command attaches each axis.
     xTaskCreatePinnedToCore(gimbalTask, "gimbal", 3072, NULL, 2, NULL, 1);
-    Serial.printf("[Gimbal] 360°舵机已就绪(速度模式): 左右=GPIO%d 上下=GPIO%d, 按住速度=%d%%\n",
+    Serial.printf("[Gimbal] 360°连续舵机已就绪(仅动作时输出): 左右=GPIO%d 上下=GPIO%d, 速度=%d%%\n",
                   GIMBAL_PIN_PAN, GIMBAL_PIN_TILT, GIMBAL_SPEED);
 }
 
 void move(const char *dir, bool pressed)
 {
-    uint8_t bit;
+    uint8_t bit = 0;
     if      (!strcmp(dir, "up"))    bit = DIR_UP;
     else if (!strcmp(dir, "down"))  bit = DIR_DOWN;
     else if (!strcmp(dir, "left"))  bit = DIR_LEFT;
     else if (!strcmp(dir, "right")) bit = DIR_RIGHT;
     else return;
 
-    if (pressed) s_flags |= bit;    // 按住: 置位, 任务持续输出油门
-    else         s_flags &= ~bit;   // 松开: 清除, 任务输出空挡刹车
+    if (pressed) {
+        s_flags |= bit;
+    } else {
+        s_flags &= (uint8_t)~bit;
+    }
 }
 
 } // namespace gimbal

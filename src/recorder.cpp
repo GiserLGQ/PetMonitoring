@@ -2,6 +2,7 @@
 #include "hardware_config.h"
 #include <WiFi.h>
 #include "esp_camera.h"
+#include "camera_sync.h"
 
 static volatile bool s_running = false;
 
@@ -29,8 +30,13 @@ static void recordTask(void *)
 
     uint32_t frames = 0, bytes = 0;
     while (s_running) {
+        if (!camera_sync::lock(5000)) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {          // 帧未就绪, 稍后重试
+            camera_sync::unlock();
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -43,6 +49,7 @@ static void recordTask(void *)
             s_running = false;
         }
         esp_camera_fb_return(fb);
+        camera_sync::unlock();
     }
 
     client.stop();

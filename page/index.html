@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>ESP32-CAM 摄像头控制台</title>
-    <link rel="stylesheet" href="/style.css?v=8">
+    <link rel="stylesheet" href="/style.css?v=11">
 </head>
 <body>
 <div class="container">
@@ -20,15 +20,15 @@
             <label for="framesize">分辨率</label>
             <select id="framesize" class="default-action">
                 <option value="1">QQVGA (160x120)</option>
-                <option value="5">QVGA (320x240)</option>
-                <option value="6">CIF (400x296)</option>
-                <option value="7">HVGA (480x320)</option>
-                <option value="8">VGA (640x480)</option>
-                <option value="9">SVGA (800x600)</option>
-                <option value="10">XGA (1024x768)</option>
-                <option value="11">HD (1280x720)</option>
-                <option value="12">SXGA (1280x1024)</option>
-                <option value="13">UXGA (1600x1200)</option>
+                <option value="6" selected>QVGA (320x240)</option>
+                <option value="8">CIF (400x296)</option>
+                <option value="9">HVGA (480x320)</option>
+                <option value="10">VGA (640x480)</option>
+                <option value="11">SVGA (800x600)</option>
+                <option value="12">XGA (1024x768)</option>
+                <option value="13">HD (1280x720)</option>
+                <option value="14">SXGA (1280x1024)</option>
+                <option value="15">UXGA (1600x1200)</option>
             </select>
         </div>
 
@@ -62,11 +62,11 @@
         <div class="group">
             <label>云台遥控</label>
             <div class="ptz-pad">
-                <button class="ptz-btn ptz-up"    id="ptz-up"    aria-label="向上">&#9650;</button>
-                <button class="ptz-btn ptz-left"  id="ptz-left"  aria-label="向左">&#9664;</button>
-                <button class="ptz-btn ptz-talk"  id="ptz-talk"  aria-label="对话">对话</button>
+                <button class="ptz-btn ptz-up" id="ptz-up" aria-label="向上">&#9650;</button>
+                <button class="ptz-btn ptz-left" id="ptz-left" aria-label="向左">&#9664;</button>
+                <button class="ptz-btn ptz-talk" id="ptz-talk" aria-label="对话">对话</button>
                 <button class="ptz-btn ptz-right" id="ptz-right" aria-label="向右">&#9654;</button>
-                <button class="ptz-btn ptz-down"  id="ptz-down"  aria-label="向下">&#9660;</button>
+                <button class="ptz-btn ptz-down" id="ptz-down" aria-label="向下">&#9660;</button>
             </div>
             <p class="hint">方向键: 按住移动, 松开停止; 中间键: 长按对话。</p>
         </div>
@@ -92,6 +92,6 @@
         </figure>
     </main>
 </div>
-<script src="/script.js?v=10"></script>
+<script src="/script.js?v=13"></script>
 </body>
 </html>
